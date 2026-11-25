@@ -80,7 +80,7 @@ jobs:
         working-directory: src
         shell: bash
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           hashes=nix-support/node_modules-hashes.json
           if ! jq -e '.nodeModules["aarch64-linux"]' "$hashes" >/dev/null; then
             jq '.nodeModules["aarch64-linux"] = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' "$hashes" > "$hashes.new" && mv "$hashes.new" "$hashes"
