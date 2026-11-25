@@ -33,6 +33,7 @@ jobs:
           df -h /
 
       - name: Clone Macro
+        shell: bash
         id: src
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
@@ -63,15 +64,46 @@ jobs:
             accept-flake-config = true
             max-jobs = auto
 
+      # Macro pins its bun node_modules hash only for x86_64-linux and
+      # aarch64-darwin. Add an aarch64-linux entry (placeholder first), let Nix
+      # report the real hash, write it in, and build again.
       - name: Build service binaries
         if: steps.check.outputs.skip != 'true'
         working-directory: src
+        shell: bash
         run: |
-          nix build .#local-stack-binaries --out-link ../bins -L 2>&1 | tail -n 400
+          set -uo pipefail
+          hashes=nix-support/node_modules-hashes.json
+          if ! jq -e '.nodeModules["aarch64-linux"]' "$hashes" >/dev/null; then
+            jq '.nodeModules["aarch64-linux"] = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' "$hashes" > "$hashes.new" && mv "$hashes.new" "$hashes"
+          fi
+          git add -A >/dev/null
+          for attempt in 1 2 3 4; do
+            echo "::group::nix build attempt $attempt"
+            nix build .#local-stack-binaries --out-link ../bins -L > ../build.log 2>&1
+            rc=$?
+            tail -n 300 ../build.log
+            echo "::endgroup::"
+            [ $rc -eq 0 ] && break
+            spec=$(grep -oP 'specified:\s+\Ksha256-\S+' ../build.log | head -1 || true)
+            got=$(grep -oP 'got:\s+\Ksha256-\S+' ../build.log | head -1 || true)
+            if [ -n "$spec" ] && [ -n "$got" ]; then
+              echo "Fixed-output hash mismatch: $spec -> $got"
+              grep -rlF "$spec" nix nix-support | xargs sed -i "s|$spec|$got|g"
+              git add -A >/dev/null
+              continue
+            fi
+            echo "::error::nix build failed (not a hash mismatch)"
+            grep -E "^error|error:" ../build.log | tail -n 20
+            exit 1
+          done
+          [ -e ../bins ] || { echo "::error::no build output"; exit 1; }
           readlink -f ../bins
           ls -la ../bins/bin | head -60
+          git diff --cached --stat
 
       - name: Export Nix closure
+        shell: bash
         if: steps.check.outputs.skip != 'true'
         run: |
           out="$(readlink -f bins)"
