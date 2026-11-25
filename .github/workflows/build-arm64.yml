@@ -1,0 +1,94 @@
+name: Build Macro for Raspberry Pi (arm64)
+
+# Builds the latest macro-inc/macro service binaries for aarch64-linux and
+# publishes them as a Nix binary cache in a GitHub Release. The Pi downloads
+# the newest release and imports it with `nix copy`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "macro-inc/macro branch, tag or commit"
+        default: main
+  schedule:
+    - cron: "0 22 * * 0" # Sundays 10 pm UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-arm64
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Clone Macro
+        id: src
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git clone --filter=blob:none https://github.com/macro-inc/macro.git src
+          cd src
+          git checkout "${{ inputs.ref || 'main' }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this commit is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName -q '.[].tagName' | grep -q -- "-${{ steps.src.outputs.short }}$"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already built macro@${{ steps.src.outputs.short }}"
+          fi
+
+      - name: Install Nix
+        if: steps.check.outputs.skip != 'true'
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            max-jobs = auto
+
+      - name: Build service binaries
+        if: steps.check.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          nix build .#local-stack-binaries --out-link ../bins -L 2>&1 | tail -n 400
+          readlink -f ../bins
+          ls -la ../bins/bin | head -60
+
+      - name: Export Nix closure
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          out="$(readlink -f bins)"
+          nix path-info -rSh "$out" | sort -k2 -h | tail -n 15
+          nix copy --to "file://$PWD/nixcache?compression=zstd" "$out"
+          echo "$out" > store-path.txt
+          echo "${{ steps.src.outputs.sha }}" > macro-commit.txt
+          tar -cf - -C nixcache . | split -b 1900M - closure.tar.part-
+          ls -lh closure.tar.part-* store-path.txt
+
+      - name: Publish release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${{ steps.src.outputs.date }}-${{ steps.src.outputs.short }}"
+          gh release create "$tag" closure.tar.part-* store-path.txt macro-commit.txt \
+            -R "$GITHUB_REPOSITORY" \
+            --title "Macro ${{ steps.src.outputs.short }} (arm64)" \
+            --notes "Built from macro-inc/macro@${{ steps.src.outputs.sha }} for aarch64-linux."
