@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "macro-inc/macro branch, tag or commit"
-        default: main
+        description: "macro-inc/macro tag, branch or commit (default: their latest production release)"
+        default: latest-release
   schedule:
     - cron: "0 22 * * 0" # Sundays 10 pm UTC
 
@@ -37,10 +37,18 @@ jobs:
         id: src
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
+          GH_TOKEN: ${{ github.token }}
         run: |
+          ref="${{ inputs.ref || 'latest-release' }}"
+          if [ "$ref" = "latest-release" ]; then
+            # Macro tags each production release (vYYYY.MM.DD.N): build what macro.com runs.
+            ref="$(gh release view -R macro-inc/macro --json tagName -q .tagName)"
+          fi
+          echo "Building macro-inc/macro @ $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
           git clone --filter=blob:none https://github.com/macro-inc/macro.git src
           cd src
-          git checkout "${{ inputs.ref || 'main' }}"
+          git checkout "$ref"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
@@ -122,5 +130,5 @@ jobs:
           tag="build-${{ steps.src.outputs.date }}-${{ steps.src.outputs.short }}"
           gh release create "$tag" closure.tar.part-* store-path.txt macro-commit.txt \
             -R "$GITHUB_REPOSITORY" \
-            --title "Macro ${{ steps.src.outputs.short }} (arm64)" \
-            --notes "Built from macro-inc/macro@${{ steps.src.outputs.sha }} for aarch64-linux."
+            --title "Macro ${{ steps.src.outputs.ref }} (arm64)" \
+            --notes "Built from macro-inc/macro ${{ steps.src.outputs.ref }} (${{ steps.src.outputs.sha }}) for aarch64-linux."

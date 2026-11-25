@@ -1,0 +1,74 @@
+name: Security advisories (deployed build)
+
+# Adapted from macro-inc/macro's daily `cargo deny advisories` job, but run
+# against the Macro version this repo last built for the Pi. A failure opens
+# (or updates) an issue here, so GitHub notifies the owner.
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # daily 6:30 am UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Find the deployed Macro commit
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName' || true)"
+          if [ -z "$tag" ]; then echo "No build released yet; nothing to check."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -p macro-commit.txt -O commit.txt
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cat commit.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Macro at that commit
+        if: steps.rel.outputs.skip != 'true'
+        shell: bash
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git clone --filter=blob:none https://github.com/macro-inc/macro.git src
+          git -C src checkout "${{ steps.rel.outputs.sha }}"
+
+      - name: Install cargo-deny
+        if: steps.rel.outputs.skip != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check advisories
+        if: steps.rel.outputs.skip != 'true'
+        id: deny
+        shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          cargo deny --log-level warn check advisories 2>&1 | tee ../deny.log
+
+      - name: Open or update an issue
+        if: failure() && steps.deny.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Security advisory in the Pi's Macro build"
+          body="$(printf 'cargo deny found RustSec advisories in Macro build **%s** (macro-inc/macro@%s).\n\nUsually fixed by the next upstream release; the weekly build picks it up. Run: %s\n\n```\n%s\n```' \
+            "${{ steps.rel.outputs.tag }}" "${{ steps.rel.outputs.sha }}" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "$(grep -E '^(error|warning)\[|ID:|Crate:|Version:|Title:|Solution:' ../deny.log | head -n 60)")"
+          num="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number')"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
