@@ -31,6 +31,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost || true
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
+          # 16 GB RAM is not enough for Macro's parallel Rust builds; add swap.
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /swapfile-build && sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build >/dev/null && sudo swapon /swapfile-build
+          free -h
 
       - name: Clone Macro
         shell: bash
@@ -70,7 +75,8 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
-            max-jobs = auto
+            max-jobs = 2
+            cores = 2
 
       # Macro pins its bun node_modules hash only for x86_64-linux and
       # aarch64-darwin. Add an aarch64-linux entry (placeholder first), let Nix
@@ -86,6 +92,8 @@ jobs:
             jq '.nodeModules["aarch64-linux"] = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' "$hashes" > "$hashes.new" && mv "$hashes.new" "$hashes"
           fi
           git add -A >/dev/null
+          # Log memory and disk every 5 minutes, so a kill can be diagnosed.
+          ( while true; do echo "[$(date -u +%H:%M)] $(free -m | awk '/Mem/{print "mem used " $3 "/" $2 " MB"}') $(free -m | awk '/Swap/{print "swap " $3 " MB"}') disk $(df -h / | awk 'NR==2{print $4}') free"; sleep 300; done ) &
           for attempt in 1 2 3 4; do
             echo "::group::nix build attempt $attempt"
             nix build .#local-stack-binaries --out-link ../bins -L > ../build.log 2>&1
@@ -109,6 +117,14 @@ jobs:
           readlink -f ../bins
           ls -la ../bins/bin | head -60
           git diff --cached --stat
+
+      - name: Upload build log
+        if: always() && steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Export Nix closure
         shell: bash
