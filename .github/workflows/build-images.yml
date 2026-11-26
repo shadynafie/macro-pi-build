@@ -1,0 +1,62 @@
+name: Build Macro container images (arm64)
+
+# sync_service compiles Rust to WebAssembly inside Docker, which the Pi 4 (4 GB
+# RAM, 64 GB stick) cannot do. Build sync_service and lexical_service here for
+# arm64 and attach them to the latest Pi release as a `docker save` archive.
+# The Pi loads them and tags them with the names its generated compose expects.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to attach to (default: latest)"
+        default: ""
+  workflow_run:
+    workflows: ["Build Macro for Raspberry Pi (arm64)"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  images:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Find release and Macro commit
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release }}"
+          [ -n "$tag" ] || tag="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')"
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -p macro-commit.txt -O commit.txt
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cat commit.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Clone Macro
+        shell: bash
+        run: |
+          git clone --filter=blob:none https://github.com/macro-inc/macro.git src
+          git -C src checkout "${{ steps.rel.outputs.sha }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build images
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --load -t macro-pi/sync-service:latest -f docker/sync-service.Dockerfile .
+          docker buildx build --load -t macro-pi/lexical-service:latest -f docker/lexical-service.Dockerfile \
+            --build-arg GITHUB_PACKAGES_TOKEN= .
+          docker save macro-pi/sync-service:latest macro-pi/lexical-service:latest | zstd -T0 -10 -o ../images.tar.zst
+          ls -lh ../images.tar.zst
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.rel.outputs.tag }}" images.tar.zst --clobber -R "$GITHUB_REPOSITORY"
