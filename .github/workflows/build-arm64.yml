@@ -118,6 +118,21 @@ jobs:
           ls -la ../bins/bin | head -60
           git diff --cached --stat
 
+      # run_local also wants the Gmail/Outlook/model emulators, which Macro's
+      # local-stack-binaries bundle leaves out. Build them in the dev shell.
+      - name: Build emulators
+        if: steps.check.outputs.skip != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop --accept-flake-config -c env CARGO_BUILD_JOBS=2 RUSTC_WRAPPER= SQLX_OFFLINE=true \
+            cargo build --release --target-dir ../emu-target -p gmail_emulator -p outlook_emulator -p model_emulator
+          mkdir -p ../emulators
+          cp ../emu-target/release/{gmail_emulator,outlook_emulator,model_emulator} ../emulators/
+          tar -C ../emulators -czf ../emulators.tar.gz .
+          ls -lh ../emulators.tar.gz
+
       - name: Upload build log
         if: always() && steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
@@ -144,7 +159,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="build-${{ steps.src.outputs.date }}-${{ steps.src.outputs.short }}"
-          gh release create "$tag" closure.tar.part-* store-path.txt macro-commit.txt \
+          gh release create "$tag" closure.tar.part-* emulators.tar.gz store-path.txt macro-commit.txt \
             -R "$GITHUB_REPOSITORY" \
             --title "Macro ${{ steps.src.outputs.ref }} (arm64)" \
             --notes "Built from macro-inc/macro ${{ steps.src.outputs.ref }} (${{ steps.src.outputs.sha }}) for aarch64-linux."
