@@ -1,0 +1,79 @@
+name: Build Macro web app (static bundle)
+
+# The Pi 4 (4 GB) cannot build Macro's web app in reasonable time. The bundle is
+# plain JS/WASM, so build it here with the same settings `just run_local
+# --static-frontend` uses, and attach it to the latest Pi release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to attach to (default: latest)"
+        default: ""
+  workflow_run:
+    workflows: ["Build Macro for Raspberry Pi (arm64)"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  frontend:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Find release and Macro commit
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release }}"
+          [ -n "$tag" ] || tag="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')"
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -p macro-commit.txt -O commit.txt
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cat commit.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+
+      - name: Clone Macro
+        shell: bash
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git clone --filter=blob:none https://github.com/macro-inc/macro.git src
+          git -C src checkout "${{ steps.rel.outputs.sha }}"
+          git -C src lfs install --local && git -C src lfs pull || true
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Build bundle
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop --accept-flake-config -c bash -euo pipefail -c '
+            export RUSTC_WRAPPER=
+            bun install --frozen-lockfile
+            cd apps/web
+            bun run dev:prepare
+            MODE=development NODE_ENV=production VITE_LOCAL_SERVERS=ALL \
+            VITE_LOCAL_BACKEND_ORIGIN=same-origin VITE_LOCAL_ONLY=true \
+            VITE_AI_EDITING_WORKER_URL=/ai-editing VITE_LOCAL_STACK=true \
+              bun run --bun build
+          '
+          test -f apps/web/dist/index.html
+          tar -C apps/web/dist -czf ../frontend.tar.gz .
+          ls -lh ../frontend.tar.gz
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.rel.outputs.tag }}" frontend.tar.gz --clobber -R "$GITHUB_REPOSITORY"
